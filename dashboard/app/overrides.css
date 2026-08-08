@@ -1,0 +1,5 @@
+/* Content should never scroll underneath the dashboard toolbar. */
+header {
+  position: relative;
+  background: rgba(7, 16, 30, 0.96);
+}
