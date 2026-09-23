@@ -1,9 +1,11 @@
 import json
 import sqlite3
+from .learning import outcome_features
 from contextlib import contextmanager
 from pathlib import Path
 
-DB_PATH = Path(__file__).resolve().parents[1] / "paper_trader.db"
+# Execution revision 2 starts a separate journal; preserve the original evidence.
+DB_PATH = Path(__file__).resolve().parents[1] / "paper_trader_v2.db"
 
 
 @contextmanager
@@ -33,10 +35,19 @@ def initialize(starting_balance: float):
         columns = {row["name"] for row in db.execute("PRAGMA table_info(trades)")}
         if "entry_candle_time" not in columns:
             db.execute("ALTER TABLE trades ADD COLUMN entry_candle_time TEXT")
+        if "setup_id" not in columns:
+            db.execute("ALTER TABLE trades ADD COLUMN setup_id TEXT")
+        db.execute("CREATE UNIQUE INDEX IF NOT EXISTS trades_setup_id ON trades(setup_id) WHERE setup_id IS NOT NULL")
         db.execute("""CREATE TABLE IF NOT EXISTS signals (
             id INTEGER PRIMARY KEY AUTOINCREMENT, candle_time TEXT UNIQUE,
             action TEXT NOT NULL, confidence REAL NOT NULL, price REAL NOT NULL,
-            reason TEXT NOT NULL, indicators TEXT NOT NULL, created_at TEXT NOT NULL)""")
+            reason TEXT NOT NULL, indicators TEXT NOT NULL, created_at TEXT NOT NULL,
+            market_bias TEXT NOT NULL DEFAULT 'NEUTRAL', bias_score INTEGER NOT NULL DEFAULT 0)""")
+        signal_columns = {row["name"] for row in db.execute("PRAGMA table_info(signals)")}
+        if "market_bias" not in signal_columns:
+            db.execute("ALTER TABLE signals ADD COLUMN market_bias TEXT NOT NULL DEFAULT 'NEUTRAL'")
+        if "bias_score" not in signal_columns:
+            db.execute("ALTER TABLE signals ADD COLUMN bias_score INTEGER NOT NULL DEFAULT 0")
         db.execute("""CREATE TABLE IF NOT EXISTS trade_patterns (
             id INTEGER PRIMARY KEY AUTOINCREMENT, trade_id INTEGER NOT NULL UNIQUE,
             side TEXT NOT NULL, outcome TEXT NOT NULL, pnl REAL NOT NULL,
@@ -48,8 +59,10 @@ def initialize(starting_balance: float):
             db.execute("""INSERT OR IGNORE INTO trade_patterns
                 (trade_id,side,outcome,pnl,exit_reason,features,closed_at) VALUES(?,?,?,?,?,?,?)""",
                 (item["id"], item["side"], "WIN" if item["pnl"] > 0 else "LOSS", item["pnl"],
-                 item["reason"] or "UNKNOWN", json.dumps(json.loads(item["signal_snapshot"])["indicators"]),
+                 item["reason"] or "UNKNOWN", json.dumps(outcome_features(json.loads(item["signal_snapshot"]))),
                  item["closed_at"] or item["opened_at"]))
+            db.execute("UPDATE trade_patterns SET features=? WHERE trade_id=?",
+                       (json.dumps(outcome_features(json.loads(item["signal_snapshot"]))), item["id"]))
 
 
 def row_dict(row):

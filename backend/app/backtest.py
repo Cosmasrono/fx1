@@ -3,8 +3,12 @@ from dataclasses import dataclass
 
 import pandas as pd
 
-from .strategy import enrich, signal_from
-from .trend import entry_allowed
+from .active_strategy import active_name, signal_from
+from .strategy import enrich, order_levels
+from .config import settings as app_settings
+from .execution import account_risk_gate, position_gate, filter_setup, exit_fill
+from .learning import assess_examples, outcome_features
+from .market import interval_minutes
 
 
 @dataclass(frozen=True)
@@ -33,61 +37,88 @@ def run_backtest(
     higher_timeframes = higher_timeframes or {}
     higher_trends = _prepare_higher_timeframe_trends(higher_timeframes)
     balance = settings.starting_balance
+    mark = balance
     equity_peak = balance
     max_drawdown = 0.0
-    open_trade = None
+    open_trades = []
     closed = []
+    patterns = []
+    next_id = 1
+    peak_positions = 0
+    used_setups = set()
     monthly = defaultdict(lambda: {"trades": 0, "pnl": 0.0})
     execution_cost = (settings.spread_pips / 2 + settings.slippage_pips) * settings.pip_size
 
-    for index in range(len(data)):
+    # The last provider row may still be forming and cannot settle a trade.
+    for index in range(max(0, len(data) - 1)):
         row = data.iloc[index]
         candle_time = pd.Timestamp(row.datetime)
+        decision_time = candle_time + pd.Timedelta(minutes=interval_minutes())
 
-        if open_trade:
-            exit_price = _exit_price(open_trade, float(row.high), float(row.low), execution_cost)
-            if exit_price is not None:
+        for open_trade in list(open_trades):
+            fill = exit_fill(open_trade, float(row.high), float(row.low), execution_cost)
+            if fill is not None:
+                exit_price, reason = fill
                 pnl = (exit_price - open_trade["entry"]) * open_trade["units"] * open_trade["direction"]
                 pnl = round(pnl, 2)
                 balance += pnl
                 closed.append({
+                    "id": open_trade["id"],
                     "side": open_trade["side"],
                     "entry_time": open_trade["entry_time"],
                     "exit_time": candle_time,
+                    "closed_at": decision_time.isoformat(),
                     "pnl": pnl,
-                    "reason": "STOP_LOSS" if exit_price == open_trade["stop"] else "TAKE_PROFIT",
+                    "reason": reason,
+                    "session": open_trade["session"],
                 })
                 month = candle_time.strftime("%Y-%m")
                 monthly[month]["trades"] += 1
                 monthly[month]["pnl"] += pnl
-                open_trade = None
+                patterns.append({"side": open_trade["side"], "outcome": "WIN" if pnl > 0 else "LOSS",
+                                 "features": outcome_features(open_trade["signal"]), "pnl": pnl,
+                                 "closed_at": decision_time.isoformat()})
+                open_trades.remove(open_trade)
 
-        if open_trade is None and index < len(data) - 1:
+        if index >= 2:
             signal = _signal_at(data, index)
-            if signal["action"] in ("BUY", "SELL") and settings.higher_timeframe_filter:
-                context = _higher_timeframe_context_at(higher_trends, candle_time)
-                signal["indicators"]["weekly_trend"] = context["weekly"]["trend"]
-                signal["indicators"]["monthly_trend"] = context["monthly"]["trend"]
-                if not entry_allowed(signal["action"], context):
+            signal["execution_price"] = float(data.open.iloc[index + 1])
+            decision_time = pd.Timestamp(data.datetime.iloc[index + 1])
+            signal["model"] = active_name()
+            context = _higher_timeframe_context_at(higher_trends, decision_time)
+            signal["indicators"]["weekly_trend"] = context["weekly"]["trend"]
+            signal["indicators"]["monthly_trend"] = context["monthly"]["trend"]
+            filter_setup(signal, context, settings.higher_timeframe_filter)
+            if signal["action"] in ("BUY", "SELL"):
+                memory = assess_examples(patterns, signal, app_settings.pattern_min_loss_matches,
+                                         app_settings.pattern_similarity_threshold, decision_time)
+                allowed = (not memory["blocked"] and account_risk_gate(
+                    closed, balance, decision_time, open_trades, balance * settings.risk_percent / 100)["allowed"]
+                           and (not signal.get("setup_id") or signal["setup_id"] not in used_setups)
+                           and position_gate(signal["action"], open_trades)["allowed"])
+                if not allowed:
                     signal["action"] = "HOLD"
             if signal["action"] in ("BUY", "SELL"):
-                atr = signal["indicators"]["atr"]
-                direction = 1 if signal["action"] == "BUY" else -1
-                entry = signal["price"] + direction * execution_cost
-                stop_distance = atr * settings.stop_multiplier + execution_cost
-                risk_amount = balance * settings.risk_percent / 100
-                units = risk_amount / stop_distance
-                open_trade = {
-                    "entry": entry,
-                    "stop": entry - direction * stop_distance,
-                    "target": entry + direction * atr * settings.target_multiplier,
-                    "units": units,
-                    "direction": direction,
-                    "side": signal["action"],
-                    "entry_time": candle_time,
-                }
+                try:
+                    levels = order_levels(signal, balance, settings.risk_percent,
+                                          settings.stop_multiplier, settings.target_multiplier, execution_cost)
+                except ValueError:
+                    levels = None
+                if levels is not None:
+                    direction = 1 if signal["action"] == "BUY" else -1
+                    open_trades.append({
+                        **levels, "id": next_id, "signal": signal,
+                        "direction": direction,
+                        "side": signal["action"],
+                        "entry_time": decision_time,
+                        "session": signal["indicators"]["session"],
+                    })
+                    next_id += 1
+                    if signal.get("setup_id"):
+                        used_setups.add(signal["setup_id"])
+                    peak_positions = max(peak_positions, len(open_trades))
 
-        mark = balance if open_trade is None else balance + (float(row.close) - open_trade["entry"]) * open_trade["units"] * open_trade["direction"]
+        mark = balance + sum((float(data.open.iloc[index + 1]) - trade["entry"]) * trade["units"] * trade["direction"] for trade in open_trades)
         equity_peak = max(equity_peak, mark)
         max_drawdown = max(max_drawdown, (equity_peak - mark) / equity_peak * 100)
 
@@ -98,17 +129,30 @@ def run_backtest(
     return {
         "bars": len(data),
         "assumptions": {
+            "strategy": active_name(),
             "spread_pips": settings.spread_pips,
             "slippage_pips": settings.slippage_pips,
             "higher_timeframe_filter": settings.higher_timeframe_filter,
+            "max_concurrent_trades": app_settings.max_concurrent_trades,
+            "risk_percent": settings.risk_percent,
+            "account_risk_limits": True,
+            "entry_pricing": "Next candle open plus costs; live uses its first available sampled price",
+            "setup_deduplication": True,
+            "open_risk_reserved": True,
+            "pattern_memory": "Learns only from earlier exits in this replay",
+            "excluded_gates": ["Economic news calendar", "Prediction model (requires models trained before each replay period)",
+                               "Live feed freshness checks"],
         },
         "metrics": {
             "starting_balance": round(settings.starting_balance, 2),
             "ending_balance": round(balance, 2),
+            "ending_equity": round(mark, 2),
+            "equity_return_percent": round((mark / settings.starting_balance - 1) * 100, 2),
             "net_pnl": round(balance - settings.starting_balance, 2),
             "return_percent": round((balance / settings.starting_balance - 1) * 100, 2),
             "closed_trades": len(closed),
-            "open_trades": 1 if open_trade else 0,
+            "open_trades": len(open_trades),
+            "peak_open_trades": peak_positions,
             "win_rate": round(len(wins) / len(closed) * 100, 1) if closed else 0,
             "profit_factor": round(gross_profit / gross_loss, 2) if gross_loss else None,
             "average_win": round(gross_profit / len(wins), 2) if wins else 0,
@@ -120,10 +164,19 @@ def run_backtest(
     }
 
 
+# Bars of context handed to the entry model at each step. The classic model
+# reads only the last few rows, and the SMC model scans swings across the
+# window, so a bounded slice is equivalent to the full prefix while keeping the
+# replay linear instead of quadratic. It also matches what the live engine sees,
+# which fetches a fixed number of candles rather than all history.
+SIGNAL_LOOKBACK = 250
+
+
 def _signal_at(data: pd.DataFrame, index: int) -> dict:
     # signal_from treats the final row as still forming. Adding one later row makes
     # the indexed row the same fully closed candle that the live engine evaluates.
-    return signal_from(data.iloc[: index + 2])
+    start = max(0, index + 2 - SIGNAL_LOOKBACK)
+    return signal_from(data.iloc[start: index + 2])
 
 
 def _exit_price(trade: dict, high: float, low: float, execution_cost: float) -> float | None:
@@ -198,8 +251,13 @@ def _diagnostics(closed: list[dict]) -> dict:
     for trade in closed:
         hours[pd.Timestamp(trade["entry_time"]).hour].append(trade)
     by_hour = [{"hour_utc": hour, **summary(trades)} for hour, trades in sorted(hours.items())]
+    sessions = defaultdict(list)
+    for trade in closed:
+        sessions[trade.get("session", "UNKNOWN")].append(trade)
+    by_session = {name: summary(trades) for name, trades in sorted(sessions.items())}
     streak = longest = 0
     for trade in closed:
         streak = streak + 1 if trade["pnl"] < 0 else 0
         longest = max(longest, streak)
-    return {"overall": summary(closed), "by_side": side, "by_hour_utc": by_hour, "max_consecutive_losses": longest}
+    return {"overall": summary(closed), "by_side": side, "by_hour_utc": by_hour,
+            "by_session": by_session, "max_consecutive_losses": longest}

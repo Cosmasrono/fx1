@@ -8,7 +8,11 @@ def test_backtest_returns_cost_aware_metrics():
     result = run_backtest(synthetic_candles(300), BacktestSettings(10_000, 1, 1, 1.5))
 
     assert result["bars"] > 200
-    assert result["assumptions"] == {"spread_pips": 0.8, "slippage_pips": 0.1, "higher_timeframe_filter": False}
+    assumptions = result["assumptions"]
+    assert assumptions["strategy"] == "classic"
+    assert assumptions["spread_pips"] == .8 and assumptions["slippage_pips"] == .1
+    assert assumptions["account_risk_limits"] and assumptions["max_concurrent_trades"] == 3
+    assert assumptions["excluded_gates"]
     assert result["metrics"]["starting_balance"] == 10_000
     assert result["metrics"]["max_drawdown_percent"] >= 0
     assert result["diagnostics"]["overall"]["trades"] == result["metrics"]["closed_trades"]

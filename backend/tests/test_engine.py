@@ -2,6 +2,7 @@ import json
 import sqlite3
 
 import pytest
+from datetime import datetime, timezone
 
 from app.engine import PaperEngine
 
@@ -53,3 +54,13 @@ def test_timestamp_comparison_accepts_database_and_pandas_formats():
     candle_value = "2026-08-07 09:10:00+00:00"
 
     assert PaperEngine._timestamp(candle_value) > PaperEngine._timestamp(database_value)
+
+
+def test_account_gate_blocks_three_consecutive_losses():
+    db = sqlite3.connect(":memory:")
+    db.execute("CREATE TABLE trades (id INTEGER PRIMARY KEY, status TEXT, closed_at TEXT, pnl REAL)")
+    for trade_id in range(1, 4):
+        db.execute("INSERT INTO trades VALUES (?, 'CLOSED', '2026-08-12T09:00:00+00:00', -50)", (trade_id,))
+    result = PaperEngine._account_risk_gate(db, 10_000, datetime(2026, 8, 12, 12, tzinfo=timezone.utc))
+    assert result["allowed"] is False
+    assert "consecutive losses" in result["reason"]

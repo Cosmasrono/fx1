@@ -1,8 +1,39 @@
-node_modules
-.next
-.venv
-__pycache__
-*.pyc
+# Dependencies and build output
+node_modules/
+.next/
+.venv/
+
+# Python caches and test output
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local configuration and secrets (keep the examples tracked)
 .env
 .env.local
+.env.*.local
+!.env.example
+
+# Local runtime data
 paper_trader.db
+paper_trader_v2.db
+*.db-journal
+prediction_model.json
+prediction_model_v3.json
+prediction_model_v3.tmp
+training_state_v3.json
+training_state_v3.tmp
+training_state.json
+training_state.tmp
+prediction_model.tmp
+
+# Tool-specific local state
+.claude/
+
+# TypeScript incremental build cache
+*.tsbuildinfo
+
+# Downloaded market history cache (large, re-fetchable)
+backend/data/
